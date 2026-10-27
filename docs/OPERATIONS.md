@@ -5,7 +5,7 @@
 asr-serve loads ONNX Runtime dynamically. Supply one regular ONNX Runtime library through
 --ort-dylib or ORT_DYLIB_PATH; at least one is required, and both must name the same path
 when present. The process validates the selected file before model/session construction.
-LD_LIBRARY_PATH must make its selected sibling provider libraries visible.
+LD_LIBRARY_PATH must make its selected sibling provider libraries visible. The service has no built-in authentication; the OpenAI-compatible SDK bearer token is ignored. Prefer binding Docker to `127.0.0.1:8080:8080` and do not expose the service publicly without an authenticated, TLS-protected ingress covering every route.
 
 The model package is external. Its directory must contain a valid version-1 config.kv and
 the artifacts selected by the process configuration. A missing or invalid package refuses
@@ -33,12 +33,14 @@ unsupported value refuses rather than falling back.
 | --- | --- | --- |
 | ASR_MAX_CONCURRENCY | 8 | Positive integer maximum for admitted HTTP batch requests. |
 | ASR_MAX_STREAMS | 32 | Positive integer maximum for admitted WebSocket source channels. |
-| ASR_BODY_LIMIT_MB | 64 | Positive integer MiB limit for POST /v1/transcribe. |
+| ASR_BODY_LIMIT_MB | 64 | Positive integer MiB limit for POST /v1/transcribe and /v1/audio/transcriptions. |
 | ASR_REQ_TIMEOUT_SEC | 120 | Positive integer HTTP processing deadline in seconds. |
 | ASR_DEDUP | true | 1, 0, true, false, on, or off; default streaming channel-dedup choice. |
 | ASR_DEDUP_WINDOW_SEC | 4 | Positive decimal seconds, with one through nine fractional digits when fractional. |
 | ASR_DEDUP_THRESHOLD | 0.99 | Finite float in 0 through 1. |
 | ASR_BACKCHANNEL_MAX_MS | 0 | Nonnegative decimal milliseconds, with one through nine fractional digits when fractional. |
+
+Native and OpenAI batch routes share one upload-read slot. This limits simultaneous request-body buffering to one request, independently of inference concurrency. OpenAI multipart text fields are capped at 16 KiB, the multipart parser rejects more than 16 fields, and multipart reading has an ASR_REQ_TIMEOUT_SEC deadline.
 
 The service converts validated temporal policy to model samples only after opening the
 typed package and validating its sample rate. Decimal conversion uses integer arithmetic
