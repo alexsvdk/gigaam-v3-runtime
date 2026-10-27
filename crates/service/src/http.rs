@@ -26,8 +26,9 @@ use axum::routing::post;
 use gigaam_audio::{EncodedAudio, load_bytes, resample_audio};
 use gigaam_recognition::{ExecutionControl, ExecutionState};
 use gigaam_transcription::{
-    BatchChannelPolicy, BatchSetup, MultiChannelBatchError, MultiChannelBatchOptions,
-    MultiChannelBatchResult, MultiChannelBatchSetup, MultiChannelBatchTranscriber, TurnGap,
+    BatchChannelPolicy, BatchSetup, ChannelTranscript, DuplicateClassification,
+    MultiChannelBatchError, MultiChannelBatchOptions, MultiChannelBatchResult,
+    MultiChannelBatchSetup, MultiChannelBatchTranscriber, SourceChannelCount, Turn, TurnGap,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,12 +36,12 @@ use std::time::{Duration, Instant};
 /// Narrow state of the byte-consuming HTTP protocol adapter.
 #[derive(Clone)]
 pub(crate) struct HttpState {
-    context: Arc<ApplicationContext>,
-    admission: Arc<AdmissionState>,
-    metrics: Arc<Metrics>,
-    telemetry: TelemetryProducer,
-    request_timeout: Duration,
-    request_body_limit: RequestBodyLimit,
+    pub(crate) context: Arc<ApplicationContext>,
+    pub(crate) admission: Arc<AdmissionState>,
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) telemetry: TelemetryProducer,
+    pub(crate) request_timeout: Duration,
+    pub(crate) request_body_limit: RequestBodyLimit,
 }
 
 /// Cohesive private inputs assembled by the facade for the HTTP adapter state.
@@ -89,6 +90,7 @@ pub(crate) fn routes(state: HttpState) -> HttpRoutes {
     body_limited_routes(
         Router::new()
             .route("/v1/transcribe", post(transcribe))
+            .merge(crate::openai::routes())
             .with_state(state),
         limit,
     )
@@ -103,20 +105,20 @@ pub(crate) fn body_limited_test_routes(routes: Router, limit: RequestBodyLimit) 
     body_limited_routes(routes, limit.bytes())
 }
 
-enum TranscribeError {
+pub(crate) enum TranscribeError {
     BadRequest(String),
     Unavailable(String),
 }
 
 impl TranscribeError {
-    fn status(&self) -> StatusCode {
+    pub(crate) fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
-    fn message(self) -> String {
+    pub(crate) fn message(self) -> String {
         match self {
             Self::BadRequest(message) | Self::Unavailable(message) => message,
         }
@@ -155,13 +157,16 @@ fn complete_multi_channel_batch(
 
 /// A request identifier kept as both log text and a validated response header.
 #[derive(Clone)]
-struct RequestId {
+pub(crate) struct RequestId {
     text: String,
     header: HeaderValue,
 }
 
 impl RequestId {
-    fn from_headers(headers: &HeaderMap) -> Result<Self, String> {
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Result<Self, String> {
         let Some(header) = headers.get("x-request-id") else {
             let text = crate::log::new_req_id();
             let header = HeaderValue::from_bytes(text.as_bytes())
@@ -181,6 +186,12 @@ impl RequestId {
     }
 }
 
+impl RequestId {
+    pub(crate) fn header(&self) -> &HeaderValue {
+        &self.header
+    }
+}
+
 fn with_request_id(mut response: Response, request_id: &RequestId) -> Response {
     response
         .headers_mut()
@@ -189,7 +200,7 @@ fn with_request_id(mut response: Response, request_id: &RequestId) -> Response {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BatchModel {
+pub(crate) enum BatchModel {
     Ctc,
     Rnnt,
 }
@@ -203,7 +214,7 @@ impl BatchModel {
         }
     }
 
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Ctc => "ctc",
             Self::Rnnt => "rnnt",
@@ -277,7 +288,7 @@ enum HttpAdmissionDecision {
     Refused(AdmissionRefusal),
 }
 
-enum AdmittedWorkResult<T> {
+pub(crate) enum AdmittedWorkResult<T> {
     Completed(Result<T, TranscribeError>),
     WorkerFailure,
     TimedOut,
@@ -285,7 +296,7 @@ enum AdmittedWorkResult<T> {
 
 /// The production execution seam retains the admission owner inside blocking work until it
 /// terminalizes, even after the HTTP deadline has returned a timeout response.
-async fn execute_admitted_work<T, F>(
+pub(crate) async fn execute_admitted_work<T, F>(
     owner: RequestWorkOwner,
     control: ExecutionControl,
     timeout: Duration,
@@ -330,7 +341,7 @@ fn resolve_http_admission(admission: &crate::admission::AdmissionState) -> HttpA
 }
 
 /// Projects typed capacity refusal at the HTTP boundary with its preserved public history.
-fn http_admission_refusal(
+pub(crate) fn http_admission_refusal(
     refusal: AdmissionRefusal,
     metrics: &Metrics,
     request_id: &RequestId,
@@ -357,7 +368,7 @@ fn http_admission_refusal(
 }
 
 /// Completes one already-admitted HTTP history while telemetry remains a nonblocking side effect.
-fn complete_admitted_response(
+pub(crate) fn complete_admitted_response(
     response: Response,
     telemetry: &TelemetryProducer,
     request_id: &RequestId,
@@ -413,6 +424,7 @@ pub(crate) async fn transcribe(
     let timeout = state.request_timeout;
     let work_context = Arc::clone(&state.context);
     let work_metrics = Arc::clone(&metrics);
+    let native_options = query.options;
     let work = move |work_control: &ExecutionControl| {
         do_transcribe(
             &work_context,
@@ -423,7 +435,9 @@ pub(crate) async fn transcribe(
         )
     };
     let response = match execute_admitted_work(owner, control.clone(), timeout, work).await {
-        AdmittedWorkResult::Completed(Ok(json)) => json_ok(json),
+        AdmittedWorkResult::Completed(Ok(result)) => {
+            json_ok(native_projection(&result, native_options))
+        }
         AdmittedWorkResult::Completed(Err(error)) => {
             metrics.transcribe_error();
             let status = error.status();
@@ -454,14 +468,44 @@ pub(crate) async fn transcribe(
     )
 }
 
-/// Synchronous request path: decode -> channels -> scheduled recognition windows -> JSON.
+/// Shared typed output of one admitted batch transcription, before protocol projection.
+#[derive(Clone)]
+pub(crate) struct TranscriptionResult {
+    pub(crate) channels: Vec<ChannelTranscript>,
+    pub(crate) segments: Vec<Turn>,
+    turns: Vec<Turn>,
+    pub(crate) duration_sec: f32,
+    sample_rate_in: u32,
+    source_channels: SourceChannelCount,
+    duplicate: DuplicateClassification,
+    model: &'static str,
+    rtf: f32,
+}
+
+fn native_projection(result: &TranscriptionResult, options: Options) -> String {
+    transcribe_response(ResponseInput {
+        channels: &result.channels,
+        segments: &result.segments,
+        turns: &result.turns,
+        options,
+        duration_sec: result.duration_sec,
+        sample_rate_in: result.sample_rate_in,
+        source_channels: result.source_channels,
+        duplicate: result.duplicate,
+        model: result.model,
+        rtf: result.rtf,
+    })
+    .to_string()
+}
+
+/// Synchronous request path: decode -> channels -> scheduled recognition windows -> typed result.
 fn do_transcribe(
     context: &ApplicationContext,
     metrics: &Metrics,
     query: &TranscribeQuery,
     bytes: Vec<u8>,
     control: &ExecutionControl,
-) -> Result<String, TranscribeError> {
+) -> Result<TranscriptionResult, TranscribeError> {
     let scheduler = match query.model {
         BatchModel::Ctc => &context.capabilities.ctc,
         BatchModel::Rnnt => context
@@ -504,21 +548,36 @@ fn do_transcribe(
     .map_err(TranscribeError::Unavailable)?;
     let started = Instant::now();
     let result = complete_multi_channel_batch(metrics, || transcriber.transcribe(&audio))?;
-    let duration = audio.duration_seconds();
-    let rtf = started.elapsed().as_secs_f32() / duration.max(1e-6);
-    let response = transcribe_response(ResponseInput {
-        channels: result.channels(),
-        segments: result.segments(),
-        turns: result.turns(),
-        options,
-        duration_sec: duration,
+    Ok(TranscriptionResult {
+        channels: result.channels().to_vec(),
+        segments: result.segments().to_vec(),
+        turns: result.turns().to_vec(),
+        duration_sec: audio.duration_seconds(),
         sample_rate_in: source_rate,
         source_channels: result.source_channels(),
         duplicate: result.duplicate(),
         model: query.model.as_str(),
-        rtf,
-    });
-    Ok(response.to_string())
+        rtf: started.elapsed().as_secs_f32() / audio.duration_seconds().max(1e-6),
+    })
+}
+
+pub(crate) fn do_openai(
+    context: &ApplicationContext,
+    metrics: &Metrics,
+    input: &crate::openai::OpenAiWorkInput,
+    bytes: Vec<u8>,
+    control: &ExecutionControl,
+) -> Result<TranscriptionResult, TranscribeError> {
+    let model = match input.rnnt {
+        true => BatchModel::Rnnt,
+        false => BatchModel::Ctc,
+    };
+    let query = TranscribeQuery {
+        model,
+        extension: input.extension.clone(),
+        options: Options::default(),
+    };
+    do_transcribe(context, metrics, &query, bytes, control)
 }
 
 #[cfg(test)]

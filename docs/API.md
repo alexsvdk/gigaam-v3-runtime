@@ -89,6 +89,26 @@ its late result cannot replace the 504; and the request capacity remains reserve
 the work terminalizes. This does not claim that ONNX Runtime interrupts an in-flight native
 call.
 
+## OpenAI-compatible batch transcription subset
+
+The service also implements `POST /v1/audio/transcriptions` and `GET /v1/models` directly in Axum. This is a batch-only subset; it does not implement authentication, SSE, translations, SRT/VTT, diarization, language detection, or prompt conditioning. Bearer tokens are not checked. Keep the service behind a trusted local ingress; the native routes have the same exposure risk.
+
+Use multipart fields `file` and `model`. Models are `gigaam-v3` and `gigaam-v3-ctc` (CTC), plus `gigaam-v3-rnnt` only when RNN-T is loaded. `response_format` supports `json` (default), `text`, and `verbose_json`. Verbose timestamps are projected from native word/segment timings; segment timestamps are native grouped segments, not Whisper token segmentation. `language=ru`, `temperature=0`, `stream=false`, and empty `prompt` are the only accepted optional settings. Unsupported fields/settings return an OpenAI error envelope. `language` is validated as a client declaration and is not detection.
+
+Multipart bodies use the same configured route body limit as native HTTP and are parsed in memory without temporary files. Oversized bodies return 413 with the OpenAI error envelope when the multipart parser reports the configured limit. Multipart parser failures are 400. The OpenAI route returns the same `x-request-id` behavior as the native route once request handling begins.
+
+`verbose_json` omits `language` because arbitrary user-supplied packs are not guaranteed to be Russian; the accepted `language=ru` parameter is only a validated client declaration. `GET /v1/models` lists available IDs without inference. `created: 0` means unknown. The endpoint does not validate model weights beyond the loaded service capabilities. OpenAI-compatible endpoints share HTTP admission, request timeout/cancellation, transcription counters, and stage timing metrics. Authorization is not provided by this service.
+
+Python SDK example:
+
+~~~python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")
+with open("example.wav", "rb") as audio:
+    result = client.audio.transcriptions.create(model="gigaam-v3", file=audio)
+print(result.text)
+~~~
+
 ## Health, liveness, readiness, and metrics
 
 GET /health returns a JSON object with status set to ok, a models array containing ctc and,
