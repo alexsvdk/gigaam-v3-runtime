@@ -19,7 +19,7 @@ use crate::response::{Options, ResponseInput, json_err, json_ok, transcribe_resp
 use crate::telemetry::TelemetryProducer;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, Extension, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
@@ -35,12 +35,12 @@ use std::time::{Duration, Instant};
 /// Narrow state of the byte-consuming HTTP protocol adapter.
 #[derive(Clone)]
 pub(crate) struct HttpState {
-    context: Arc<ApplicationContext>,
-    admission: Arc<AdmissionState>,
-    metrics: Arc<Metrics>,
-    telemetry: TelemetryProducer,
-    request_timeout: Duration,
-    request_body_limit: RequestBodyLimit,
+    pub(crate) context: Arc<ApplicationContext>,
+    pub(crate) admission: Arc<AdmissionState>,
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) telemetry: TelemetryProducer,
+    pub(crate) request_timeout: Duration,
+    pub(crate) request_body_limit: RequestBodyLimit,
 }
 
 /// Cohesive private inputs assembled by the facade for the HTTP adapter state.
@@ -89,9 +89,150 @@ pub(crate) fn routes(state: HttpState) -> HttpRoutes {
     body_limited_routes(
         Router::new()
             .route("/v1/transcribe", post(transcribe))
+            .merge(crate::openai::routes())
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                upload_gate,
+            ))
             .with_state(state),
         limit,
     )
+}
+
+#[derive(Clone)]
+pub(crate) struct UploadGuard(Arc<UploadGuardState>);
+struct UploadGuardState {
+    permit: std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+    released: tokio::sync::Notify,
+}
+impl UploadGuard {
+    fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self(Arc::new(UploadGuardState {
+            permit: std::sync::Mutex::new(Some(permit)),
+            released: tokio::sync::Notify::new(),
+        }))
+    }
+    pub(crate) fn release(&self) {
+        if let Ok(mut permit) = self.0.permit.lock() {
+            permit.take();
+        }
+        self.0.released.notify_one();
+    }
+    fn is_released(&self) -> bool {
+        self.0
+            .permit
+            .lock()
+            .map(|permit| permit.is_none())
+            .unwrap_or(true)
+    }
+    async fn released(&self) {
+        loop {
+            let notified = self.0.released.notified();
+            if self.is_released() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+async fn upload_gate(
+    State(state): State<HttpState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    let is_transcription = request.method() == axum::http::Method::POST
+        && matches!(path, "/v1/transcribe" | "/v1/audio/transcriptions");
+    if !is_transcription {
+        return next.run(request).await;
+    }
+    let openai = path == "/v1/audio/transcriptions";
+    let started = Instant::now();
+    state.metrics.transcribe();
+    let request_id = match RequestId::from_headers(request.headers()) {
+        Ok(id) => Some(id),
+        Err(message) => {
+            state.metrics.transcribe_error();
+            let response = if openai {
+                crate::openai::error_response(StatusCode::BAD_REQUEST, message, None)
+            } else {
+                json_err(StatusCode::BAD_REQUEST, message)
+            };
+            return finish_upload_early(&state, None, started, response, openai);
+        }
+    };
+    let permit = match state.admission.admit_upload() {
+        Ok(permit) => permit,
+        Err(refusal) => {
+            let (status, message) = match refusal {
+                AdmissionRefusal::Overloaded => {
+                    state.metrics.overload();
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service overloaded, retry later",
+                    )
+                }
+                AdmissionRefusal::Draining => {
+                    state.metrics.transcribe_error();
+                    (StatusCode::SERVICE_UNAVAILABLE, "draining")
+                }
+            };
+            let response = if openai {
+                crate::openai::error_response(status, message, None)
+            } else {
+                json_err(status, message)
+            };
+            return finish_upload_early(&state, request_id.as_ref(), started, response, openai);
+        }
+    };
+    let guard = UploadGuard::new(permit);
+    let mut request = request;
+    request.extensions_mut().insert(guard.clone());
+    let request_timeout = state.request_timeout;
+    let work = next.run(request);
+    tokio::pin!(work);
+    tokio::select! {
+        response = &mut work => response,
+        _ = tokio::time::sleep(request_timeout) => {
+            if guard.is_released() { return work.await; }
+            guard.release();
+            state.metrics.timeout();
+            let response = if openai { crate::openai::error_response(StatusCode::GATEWAY_TIMEOUT, "request body read timeout", None) } else { json_err(StatusCode::GATEWAY_TIMEOUT, "processing timeout") };
+            finish_upload_early(&state, request_id.as_ref(), started, response, openai)
+        }
+        _ = guard.released() => work.await,
+    }
+}
+
+fn finish_upload_early(
+    state: &HttpState,
+    request_id: Option<&RequestId>,
+    started: Instant,
+    response: Response,
+    openai: bool,
+) -> Response {
+    state
+        .metrics
+        .observe_latency(started.elapsed().as_secs_f64());
+    match request_id {
+        Some(id) => {
+            let status = response.status().as_u16();
+            complete_admitted_response(
+                response,
+                &state.telemetry,
+                id,
+                crate::log::TranscribeAccess {
+                    request_id: id.text().to_owned(),
+                    status,
+                    milliseconds: started.elapsed().as_millis(),
+                    bytes: 0,
+                    model: if openai { "openai" } else { "native" }.to_owned(),
+                },
+            )
+        }
+        None => response,
+    }
 }
 
 fn body_limited_routes(routes: Router, limit: usize) -> HttpRoutes {
@@ -103,20 +244,20 @@ pub(crate) fn body_limited_test_routes(routes: Router, limit: RequestBodyLimit) 
     body_limited_routes(routes, limit.bytes())
 }
 
-enum TranscribeError {
+pub(crate) enum TranscribeError {
     BadRequest(String),
     Unavailable(String),
 }
 
 impl TranscribeError {
-    fn status(&self) -> StatusCode {
+    pub(crate) fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
-    fn message(self) -> String {
+    pub(crate) fn message(self) -> String {
         match self {
             Self::BadRequest(message) | Self::Unavailable(message) => message,
         }
@@ -155,13 +296,16 @@ fn complete_multi_channel_batch(
 
 /// A request identifier kept as both log text and a validated response header.
 #[derive(Clone)]
-struct RequestId {
+pub(crate) struct RequestId {
     text: String,
     header: HeaderValue,
 }
 
 impl RequestId {
-    fn from_headers(headers: &HeaderMap) -> Result<Self, String> {
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Result<Self, String> {
         let Some(header) = headers.get("x-request-id") else {
             let text = crate::log::new_req_id();
             let header = HeaderValue::from_bytes(text.as_bytes())
@@ -181,7 +325,13 @@ impl RequestId {
     }
 }
 
-fn with_request_id(mut response: Response, request_id: &RequestId) -> Response {
+impl RequestId {
+    pub(crate) fn header(&self) -> &HeaderValue {
+        &self.header
+    }
+}
+
+pub(crate) fn with_request_id(mut response: Response, request_id: &RequestId) -> Response {
     response
         .headers_mut()
         .insert("x-request-id", request_id.header.clone());
@@ -189,7 +339,7 @@ fn with_request_id(mut response: Response, request_id: &RequestId) -> Response {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BatchModel {
+pub(crate) enum BatchModel {
     Ctc,
     Rnnt,
 }
@@ -203,7 +353,7 @@ impl BatchModel {
         }
     }
 
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Ctc => "ctc",
             Self::Rnnt => "rnnt",
@@ -277,7 +427,7 @@ enum HttpAdmissionDecision {
     Refused(AdmissionRefusal),
 }
 
-enum AdmittedWorkResult<T> {
+pub(crate) enum AdmittedWorkResult<T> {
     Completed(Result<T, TranscribeError>),
     WorkerFailure,
     TimedOut,
@@ -285,7 +435,7 @@ enum AdmittedWorkResult<T> {
 
 /// The production execution seam retains the admission owner inside blocking work until it
 /// terminalizes, even after the HTTP deadline has returned a timeout response.
-async fn execute_admitted_work<T, F>(
+pub(crate) async fn execute_admitted_work<T, F>(
     owner: RequestWorkOwner,
     control: ExecutionControl,
     timeout: Duration,
@@ -330,7 +480,7 @@ fn resolve_http_admission(admission: &crate::admission::AdmissionState) -> HttpA
 }
 
 /// Projects typed capacity refusal at the HTTP boundary with its preserved public history.
-fn http_admission_refusal(
+pub(crate) fn http_admission_refusal(
     refusal: AdmissionRefusal,
     metrics: &Metrics,
     request_id: &RequestId,
@@ -357,7 +507,7 @@ fn http_admission_refusal(
 }
 
 /// Completes one already-admitted HTTP history while telemetry remains a nonblocking side effect.
-fn complete_admitted_response(
+pub(crate) fn complete_admitted_response(
     response: Response,
     telemetry: &TelemetryProducer,
     request_id: &RequestId,
@@ -374,9 +524,10 @@ pub(crate) async fn transcribe(
     State(state): State<HttpState>,
     headers: HeaderMap,
     RawQuery(query_text): RawQuery,
+    Extension(upload_guard): Extension<UploadGuard>,
     body: Bytes,
 ) -> Response {
-    state.metrics.transcribe();
+    upload_guard.release();
     let started = Instant::now();
     let metrics = Arc::clone(&state.metrics);
     let body_len = body.len();
@@ -413,6 +564,7 @@ pub(crate) async fn transcribe(
     let timeout = state.request_timeout;
     let work_context = Arc::clone(&state.context);
     let work_metrics = Arc::clone(&metrics);
+    let native_options = query.options;
     let work = move |work_control: &ExecutionControl| {
         do_transcribe(
             &work_context,
@@ -423,7 +575,9 @@ pub(crate) async fn transcribe(
         )
     };
     let response = match execute_admitted_work(owner, control.clone(), timeout, work).await {
-        AdmittedWorkResult::Completed(Ok(json)) => json_ok(json),
+        AdmittedWorkResult::Completed(Ok(result)) => {
+            json_ok(native_projection(&result, native_options))
+        }
         AdmittedWorkResult::Completed(Err(error)) => {
             metrics.transcribe_error();
             let status = error.status();
@@ -454,14 +608,39 @@ pub(crate) async fn transcribe(
     )
 }
 
-/// Synchronous request path: decode -> channels -> scheduled recognition windows -> JSON.
+/// Shared typed output of one admitted batch transcription, before protocol projection.
+pub(crate) struct TranscriptionResult {
+    pub(crate) batch: MultiChannelBatchResult,
+    pub(crate) duration_sec: f32,
+    sample_rate_in: u32,
+    model: &'static str,
+    rtf: f32,
+}
+
+fn native_projection(result: &TranscriptionResult, options: Options) -> String {
+    transcribe_response(ResponseInput {
+        channels: result.batch.channels(),
+        segments: result.batch.segments(),
+        turns: result.batch.turns(),
+        options,
+        duration_sec: result.duration_sec,
+        sample_rate_in: result.sample_rate_in,
+        source_channels: result.batch.source_channels(),
+        duplicate: result.batch.duplicate(),
+        model: result.model,
+        rtf: result.rtf,
+    })
+    .to_string()
+}
+
+/// Synchronous request path: decode -> channels -> scheduled recognition windows -> typed result.
 fn do_transcribe(
     context: &ApplicationContext,
     metrics: &Metrics,
     query: &TranscribeQuery,
     bytes: Vec<u8>,
     control: &ExecutionControl,
-) -> Result<String, TranscribeError> {
+) -> Result<TranscriptionResult, TranscribeError> {
     let scheduler = match query.model {
         BatchModel::Ctc => &context.capabilities.ctc,
         BatchModel::Rnnt => context
@@ -504,25 +683,36 @@ fn do_transcribe(
     .map_err(TranscribeError::Unavailable)?;
     let started = Instant::now();
     let result = complete_multi_channel_batch(metrics, || transcriber.transcribe(&audio))?;
-    let duration = audio.duration_seconds();
-    let rtf = started.elapsed().as_secs_f32() / duration.max(1e-6);
-    let response = transcribe_response(ResponseInput {
-        channels: result.channels(),
-        segments: result.segments(),
-        turns: result.turns(),
-        options,
-        duration_sec: duration,
+    Ok(TranscriptionResult {
+        batch: result,
+        duration_sec: audio.duration_seconds(),
         sample_rate_in: source_rate,
-        source_channels: result.source_channels(),
-        duplicate: result.duplicate(),
         model: query.model.as_str(),
-        rtf,
-    });
-    Ok(response.to_string())
+        rtf: started.elapsed().as_secs_f32() / audio.duration_seconds().max(1e-6),
+    })
+}
+
+pub(crate) fn do_openai(
+    context: &ApplicationContext,
+    metrics: &Metrics,
+    input: &crate::openai::OpenAiWorkInput,
+    bytes: Vec<u8>,
+    control: &ExecutionControl,
+) -> Result<TranscriptionResult, TranscribeError> {
+    let model = match input.rnnt {
+        true => BatchModel::Rnnt,
+        false => BatchModel::Ctc,
+    };
+    let query = TranscribeQuery {
+        model,
+        extension: input.extension.clone(),
+        options: Options::default(),
+    };
+    do_transcribe(context, metrics, &query, bytes, control)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::admission::RequestWorkOwner;
     use crate::admission::ServiceAdmission;
@@ -579,7 +769,7 @@ mod tests {
         }
     }
 
-    fn state_with_telemetry(
+    pub(crate) fn state_with_telemetry(
         fixture: &crate::tests::AssemblyFixture,
         admission: Arc<crate::admission::AdmissionState>,
         metrics: Arc<Metrics>,
@@ -1113,6 +1303,11 @@ mod tests {
             State(state),
             headers,
             RawQuery(Some("ext=wav".to_owned())),
+            axum::Extension(UploadGuard::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .expect("test permit available"),
+            )),
             Bytes::from_static(b"not-a-wave-file"),
         )
         .await;

@@ -98,6 +98,7 @@ pub(crate) enum AdmissionRefusal {
 pub(crate) struct AdmissionState {
     phase_tx: watch::Sender<AdmissionPhase>,
     http: Arc<Semaphore>,
+    uploads: Arc<Semaphore>,
     ws: Arc<Semaphore>,
     max_http: usize,
     max_ws: usize,
@@ -108,11 +109,13 @@ impl AdmissionState {
         let max_http = settings.max_http();
         let max_ws = settings.max_ws();
         let http = Arc::new(Semaphore::new(max_http));
+        let uploads = Arc::new(Semaphore::new(1));
         let ws = Arc::new(Semaphore::new(max_ws));
         let (phase_tx, _phase_rx) = watch::channel(AdmissionPhase::Running);
         Ok(Self {
             phase_tx,
             http,
+            uploads,
             ws,
             max_http,
             max_ws,
@@ -137,10 +140,26 @@ impl AdmissionState {
         });
         if changed {
             self.http.close();
+            self.uploads.close();
             self.ws.close();
             DrainTransition::Began
         } else {
             DrainTransition::AlreadyDraining
+        }
+    }
+
+    /// Reserves bounded capacity while a batch HTTP request is being read and parsed.
+    pub(crate) fn admit_upload(&self) -> Result<OwnedSemaphorePermit, AdmissionRefusal> {
+        if self.phase() == AdmissionPhase::Draining {
+            return Err(AdmissionRefusal::Draining);
+        }
+        match Arc::clone(&self.uploads).try_acquire_owned() {
+            Ok(permit) if self.phase() == AdmissionPhase::Running => Ok(permit),
+            Ok(permit) => {
+                drop(permit);
+                Err(AdmissionRefusal::Draining)
+            }
+            Err(_) => Err(self.refusal_after_capacity_failure()),
         }
     }
 

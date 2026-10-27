@@ -18,6 +18,7 @@ mod json;
 mod lifecycle;
 mod log;
 mod metrics;
+mod openai;
 mod protocol;
 mod response;
 mod router;
