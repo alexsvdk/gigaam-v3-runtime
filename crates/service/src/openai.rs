@@ -726,7 +726,7 @@ mod tests {
         assert!(
             rendered
                 .lines()
-                .any(|line| line.starts_with("asr_transcribe_requests_total ")),
+                .any(|line| line == "asr_transcribe_requests_total 2"),
             "{rendered}"
         );
         assert!(rendered.lines().any(|line| line == "asr_overload_total 1"));
@@ -740,7 +740,7 @@ mod tests {
             metrics
                 .render(0, 0, 0, None)
                 .lines()
-                .any(|line| line.starts_with("asr_transcribe_requests_total ")),
+                .any(|line| line == "asr_transcribe_requests_total 2"),
             "{}",
             metrics.render(0, 0, 0, None)
         );
