@@ -40,6 +40,8 @@ unsupported value refuses rather than falling back.
 | ASR_DEDUP_THRESHOLD | 0.99 | Finite float in 0 through 1. |
 | ASR_BACKCHANNEL_MAX_MS | 0 | Nonnegative decimal milliseconds, with one through nine fractional digits when fractional. |
 
+Native and OpenAI batch routes share one upload-read slot. This limits simultaneous request-body buffering to one request, independently of inference concurrency. OpenAI multipart text fields are capped at 16 KiB, the multipart parser rejects more than 16 fields, and multipart reading has an ASR_REQ_TIMEOUT_SEC deadline.
+
 The service converts validated temporal policy to model samples only after opening the
 typed package and validating its sample rate. Decimal conversion uses integer arithmetic
 with nonnegative half-sample rounding upward; it does not rely on a floating-point text

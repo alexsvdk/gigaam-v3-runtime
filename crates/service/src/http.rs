@@ -19,16 +19,15 @@ use crate::response::{Options, ResponseInput, json_err, json_ok, transcribe_resp
 use crate::telemetry::TelemetryProducer;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, Extension, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
 use gigaam_audio::{EncodedAudio, load_bytes, resample_audio};
 use gigaam_recognition::{ExecutionControl, ExecutionState};
 use gigaam_transcription::{
-    BatchChannelPolicy, BatchSetup, ChannelTranscript, DuplicateClassification,
-    MultiChannelBatchError, MultiChannelBatchOptions, MultiChannelBatchResult,
-    MultiChannelBatchSetup, MultiChannelBatchTranscriber, SourceChannelCount, Turn, TurnGap,
+    BatchChannelPolicy, BatchSetup, MultiChannelBatchError, MultiChannelBatchOptions,
+    MultiChannelBatchResult, MultiChannelBatchSetup, MultiChannelBatchTranscriber, TurnGap,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -91,9 +90,91 @@ pub(crate) fn routes(state: HttpState) -> HttpRoutes {
         Router::new()
             .route("/v1/transcribe", post(transcribe))
             .merge(crate::openai::routes())
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state.admission),
+                upload_gate,
+            ))
             .with_state(state),
         limit,
     )
+}
+
+#[derive(Clone)]
+pub(crate) struct UploadGuard(Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>);
+impl UploadGuard {
+    pub(crate) fn release(&self) {
+        if let Ok(mut permit) = self.0.lock() {
+            permit.take();
+        }
+    }
+}
+
+async fn upload_gate(
+    State(admission): State<Arc<AdmissionState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    let is_transcription = request.method() == axum::http::Method::POST
+        && matches!(path, "/v1/transcribe" | "/v1/audio/transcriptions");
+    if !is_transcription {
+        return next.run(request).await;
+    }
+    let openai = path == "/v1/audio/transcriptions";
+    let request_id = match RequestId::from_headers(request.headers()) {
+        Ok(id) => id,
+        Err(message) => {
+            let response = if openai {
+                crate::openai::error_response(StatusCode::BAD_REQUEST, message, None)
+            } else {
+                json_err(StatusCode::BAD_REQUEST, message)
+            };
+            return response;
+        }
+    };
+    let permit = match admission.admit_upload() {
+        Ok(permit) => permit,
+        Err(AdmissionRefusal::Overloaded) => {
+            if openai {
+                return with_request_id(
+                    crate::openai::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service overloaded, retry later",
+                        None,
+                    ),
+                    &request_id,
+                );
+            }
+            return with_request_id(
+                json_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service overloaded, retry later",
+                ),
+                &request_id,
+            );
+        }
+        Err(AdmissionRefusal::Draining) => {
+            if openai {
+                return with_request_id(
+                    crate::openai::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "draining",
+                        None,
+                    ),
+                    &request_id,
+                );
+            }
+            return with_request_id(
+                json_err(StatusCode::SERVICE_UNAVAILABLE, "draining"),
+                &request_id,
+            );
+        }
+    };
+    let mut request = request;
+    request
+        .extensions_mut()
+        .insert(UploadGuard(Arc::new(std::sync::Mutex::new(Some(permit)))));
+    next.run(request).await
 }
 
 fn body_limited_routes(routes: Router, limit: usize) -> HttpRoutes {
@@ -192,7 +273,7 @@ impl RequestId {
     }
 }
 
-fn with_request_id(mut response: Response, request_id: &RequestId) -> Response {
+pub(crate) fn with_request_id(mut response: Response, request_id: &RequestId) -> Response {
     response
         .headers_mut()
         .insert("x-request-id", request_id.header.clone());
@@ -385,8 +466,10 @@ pub(crate) async fn transcribe(
     State(state): State<HttpState>,
     headers: HeaderMap,
     RawQuery(query_text): RawQuery,
+    Extension(upload_guard): Extension<UploadGuard>,
     body: Bytes,
 ) -> Response {
+    upload_guard.release();
     state.metrics.transcribe();
     let started = Instant::now();
     let metrics = Arc::clone(&state.metrics);
@@ -469,29 +552,24 @@ pub(crate) async fn transcribe(
 }
 
 /// Shared typed output of one admitted batch transcription, before protocol projection.
-#[derive(Clone)]
 pub(crate) struct TranscriptionResult {
-    pub(crate) channels: Vec<ChannelTranscript>,
-    pub(crate) segments: Vec<Turn>,
-    turns: Vec<Turn>,
+    pub(crate) batch: MultiChannelBatchResult,
     pub(crate) duration_sec: f32,
     sample_rate_in: u32,
-    source_channels: SourceChannelCount,
-    duplicate: DuplicateClassification,
     model: &'static str,
     rtf: f32,
 }
 
 fn native_projection(result: &TranscriptionResult, options: Options) -> String {
     transcribe_response(ResponseInput {
-        channels: &result.channels,
-        segments: &result.segments,
-        turns: &result.turns,
+        channels: result.batch.channels(),
+        segments: result.batch.segments(),
+        turns: result.batch.turns(),
         options,
         duration_sec: result.duration_sec,
         sample_rate_in: result.sample_rate_in,
-        source_channels: result.source_channels,
-        duplicate: result.duplicate,
+        source_channels: result.batch.source_channels(),
+        duplicate: result.batch.duplicate(),
         model: result.model,
         rtf: result.rtf,
     })
@@ -549,13 +627,9 @@ fn do_transcribe(
     let started = Instant::now();
     let result = complete_multi_channel_batch(metrics, || transcriber.transcribe(&audio))?;
     Ok(TranscriptionResult {
-        channels: result.channels().to_vec(),
-        segments: result.segments().to_vec(),
-        turns: result.turns().to_vec(),
+        batch: result,
         duration_sec: audio.duration_seconds(),
         sample_rate_in: source_rate,
-        source_channels: result.source_channels(),
-        duplicate: result.duplicate(),
         model: query.model.as_str(),
         rtf: started.elapsed().as_secs_f32() / audio.duration_seconds().max(1e-6),
     })
@@ -581,7 +655,7 @@ pub(crate) fn do_openai(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::admission::RequestWorkOwner;
     use crate::admission::ServiceAdmission;
@@ -638,7 +712,7 @@ mod tests {
         }
     }
 
-    fn state_with_telemetry(
+    pub(crate) fn state_with_telemetry(
         fixture: &crate::tests::AssemblyFixture,
         admission: Arc<crate::admission::AdmissionState>,
         metrics: Arc<Metrics>,
@@ -1172,6 +1246,7 @@ mod tests {
             State(state),
             headers,
             RawQuery(Some("ext=wav".to_owned())),
+            axum::Extension(UploadGuard(Arc::new(std::sync::Mutex::new(None)))),
             Bytes::from_static(b"not-a-wave-file"),
         )
         .await;

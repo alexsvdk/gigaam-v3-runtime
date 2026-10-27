@@ -41,6 +41,10 @@ golden-tests = []
 # TensorRT selects Recognition's TRT execution provider and its required CUDA support.
 tensorrt = ["cuda", "gigaam-recognition/tensorrt"]
 
+[dev-dependencies]
+tower = { version = "0.5.2", features = ["util"] }
+futures-util = "0.3.31"
+
 [[test]]
 name = "http_golden"
 required-features = ["golden-tests"]
