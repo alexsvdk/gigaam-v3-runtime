@@ -272,7 +272,6 @@ pub(crate) fn routes() -> axum::Router<HttpState> {
 }
 
 async fn transcribe(State(state): State<HttpState>, request: Request) -> Response {
-    state.metrics.transcribe();
     let started = std::time::Instant::now();
     let (parts, body) = request.into_parts();
     let headers = parts.headers.clone();
@@ -313,7 +312,7 @@ async fn transcribe(State(state): State<HttpState>, request: Request) -> Respons
                 );
             }
         };
-        let field = match next_field {
+        let mut field = match next_field {
             Ok(Some(f)) => f,
             Ok(None) => break,
             Err(e) => {
@@ -337,40 +336,47 @@ async fn transcribe(State(state): State<HttpState>, request: Request) -> Respons
         }
         let name = field.name().unwrap_or("").to_owned();
         let filename = field.file_name().map(str::to_owned);
-        let bytes = match tokio::time::timeout_at(read_deadline, field.bytes()).await {
-            Ok(Ok(b)) => b,
-            Err(_) => {
-                state.metrics.timeout();
-                return with_id(
-                    ApiError {
-                        status: StatusCode::GATEWAY_TIMEOUT,
-                        message: "request body read timeout".into(),
-                        param: None,
+        let is_file = name == "file";
+        let mut field_bytes = Vec::new();
+        loop {
+            let chunk = match tokio::time::timeout_at(read_deadline, field.chunk()).await {
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Ok(None)) => break,
+                Err(_) => {
+                    state.metrics.timeout();
+                    return with_id(
+                        ApiError {
+                            status: StatusCode::GATEWAY_TIMEOUT,
+                            message: "request body read timeout".into(),
+                            param: None,
+                        }
+                        .response(),
+                        &request_id,
+                    );
+                }
+                Ok(Err(e)) => {
+                    state.metrics.transcribe_error();
+                    let status = e.status();
+                    let mut error =
+                        ApiError::bad(format!("Invalid multipart field: {}", e.body_text()), None);
+                    if status == StatusCode::PAYLOAD_TOO_LARGE {
+                        error.status = status;
+                        error.message = "request body too large".into();
                     }
-                    .response(),
+                    return with_id(error.response(), &request_id);
+                }
+            };
+            if !is_file && field_bytes.len() + chunk.len() > 16 * 1024 {
+                state.metrics.transcribe_error();
+                return with_id(
+                    ApiError::bad("multipart text field exceeds 16 KiB", None).response(),
                     &request_id,
                 );
             }
-            Ok(Err(e)) => {
-                state.metrics.transcribe_error();
-                let status = e.status();
-                let mut error =
-                    ApiError::bad(format!("Invalid multipart field: {}", e.body_text()), None);
-                if status == StatusCode::PAYLOAD_TOO_LARGE {
-                    error.status = status;
-                    error.message = "request body too large".into();
-                }
-                return with_id(error.response(), &request_id);
-            }
-        };
-        total += bytes.len();
-        if name != "file" && bytes.len() > 16 * 1024 {
-            state.metrics.transcribe_error();
-            return with_id(
-                ApiError::bad("multipart text field exceeds 16 KiB", None).response(),
-                &request_id,
-            );
+            field_bytes.extend_from_slice(&chunk);
         }
+        let bytes = axum::body::Bytes::from(field_bytes);
+        total += bytes.len();
         parts.push((name, filename, bytes.to_vec()));
     }
     let input = match parse_fields(parts, state.context.capabilities.rnnt.is_some()) {
@@ -675,7 +681,7 @@ mod tests {
     }
     #[tokio::test]
     async fn multipart_upload_read_timeout_returns_504_and_releases_upload_slot() {
-        let (router, _harness, admission) =
+        let (router, harness, admission) =
             test_router(1, 8192, std::time::Duration::from_millis(100)).await;
         use futures_util::StreamExt;
         let boundary = "test-boundary";
@@ -697,17 +703,141 @@ mod tests {
             .unwrap();
         let first_router = router.clone();
         let first = tokio::spawn(async move { first_router.oneshot(request).await.unwrap() });
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    admission.admit_upload(),
+                    Err(crate::admission::AdmissionRefusal::Overloaded)
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first request has acquired the upload slot");
         let audio = wav_silence();
         let (ct, body) = multipart(&[("file", "clip.wav", &audio), ("model", "", b"gigaam-v3")]);
         let second = call(&router, &ct, body, Some("concurrent-upload")).await;
         assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(second.headers()["x-request-id"], "concurrent-upload");
+        let metrics = harness.metrics_arc();
+        let rendered = metrics.render(0, 0, 0, None);
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.starts_with("asr_transcribe_requests_total ")),
+            "{rendered}"
+        );
+        assert!(rendered.lines().any(|line| line == "asr_overload_total 1"));
+        assert!(
+            harness.snapshot().queued >= 1,
+            "early refusal emits access telemetry"
+        );
         let response = first.await.unwrap();
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(
+            metrics
+                .render(0, 0, 0, None)
+                .lines()
+                .any(|line| line.starts_with("asr_transcribe_requests_total ")),
+            "{}",
+            metrics.render(0, 0, 0, None)
+        );
+        assert!(
             admission.admit_upload().is_ok(),
             "timed-out read releases capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_text_field_is_rejected_during_incremental_read() {
+        let (router, _harness, _admission) =
+            test_router(1, 64 * 1024, std::time::Duration::from_secs(1)).await;
+        let boundary = "large-text";
+        let mut body =
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n")
+                .into_bytes();
+        body.extend(std::iter::repeat_n(b'x', 16 * 1024 + 1));
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let response = call(
+            &router,
+            &format!("multipart/form-data; boundary={boundary}"),
+            body,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&error).unwrap().contains("16 KiB"));
+    }
+
+    #[tokio::test]
+    async fn native_stalled_body_times_out_and_upload_slot_recovers() {
+        let (router, _harness, admission) =
+            test_router(2, 8192, std::time::Duration::from_millis(30)).await;
+        use futures_util::StreamExt;
+        let chunk = Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"RIFF"));
+        let stream = futures_util::stream::iter(vec![chunk]).chain(futures_util::stream::pending());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/transcribe?ext=wav")
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), 2048)
+            .await
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .starts_with("{\"error\":")
+        );
+        assert!(admission.admit_upload().is_ok());
+    }
+
+    #[tokio::test]
+    async fn draining_refuses_native_and_openai_routes_without_reading_or_starting_work() {
+        let (router, _harness, admission) =
+            test_router(1, 8192, std::time::Duration::from_secs(1)).await;
+        admission.begin_draining();
+        let audio = wav_silence();
+        let (content_type, body) =
+            multipart(&[("file", "clip.wav", &audio), ("model", "", b"gigaam-v3")]);
+        let openai = call(&router, &content_type, body, Some("draining-openai")).await;
+        assert_eq!(openai.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(openai.headers()["x-request-id"], "draining-openai");
+        let openai_body = axum::body::to_bytes(openai.into_body(), 2048)
+            .await
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&openai_body)
+                .unwrap()
+                .contains("server_error")
+        );
+        let native = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/transcribe?ext=wav")
+                    .header("x-request-id", "draining-native")
+                    .body(axum::body::Body::from(audio))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(native.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(native.headers()["x-request-id"], "draining-native");
+        let native_body = axum::body::to_bytes(native.into_body(), 2048)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&native_body).unwrap(),
+            "{\"error\":\"draining\"}"
         );
     }
 
@@ -830,6 +960,28 @@ mod tests {
         assert_eq!(malformed.headers()["x-request-id"], "bad-content-type");
         let invalid_id = call(&router, &ct, Vec::new(), Some("")).await;
         assert_eq!(invalid_id.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn upload_limit_does_not_reduce_admitted_inference_parallelism() {
+        let (router, _harness, _admission) =
+            test_router(2, 8192, std::time::Duration::from_secs(2)).await;
+        let audio = wav_silence();
+        let (content_type, body) =
+            multipart(&[("file", "clip.wav", &audio), ("model", "", b"gigaam-v3")]);
+        let request = |body: Vec<u8>| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/audio/transcriptions")
+                .header("content-type", content_type.clone())
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        let first = router.clone().oneshot(request(body.clone()));
+        let second = router.clone().oneshot(request(body));
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap().status(), StatusCode::OK);
+        assert_eq!(second.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]
