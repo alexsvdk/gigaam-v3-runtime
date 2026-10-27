@@ -294,24 +294,8 @@ async fn transcribe(State(state): State<HttpState>, request: Request) -> Respons
     };
     let mut parts = Vec::new();
     let mut total = 0usize;
-    let read_deadline = tokio::time::Instant::now() + state.request_timeout;
     loop {
-        let next_field = match tokio::time::timeout_at(read_deadline, multipart.next_field()).await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                state.metrics.timeout();
-                return with_id(
-                    ApiError {
-                        status: StatusCode::GATEWAY_TIMEOUT,
-                        message: "request body read timeout".into(),
-                        param: None,
-                    }
-                    .response(),
-                    &request_id,
-                );
-            }
-        };
+        let next_field = multipart.next_field().await;
         let mut field = match next_field {
             Ok(Some(f)) => f,
             Ok(None) => break,
@@ -339,22 +323,10 @@ async fn transcribe(State(state): State<HttpState>, request: Request) -> Respons
         let is_file = name == "file";
         let mut field_bytes = Vec::new();
         loop {
-            let chunk = match tokio::time::timeout_at(read_deadline, field.chunk()).await {
-                Ok(Ok(Some(chunk))) => chunk,
-                Ok(Ok(None)) => break,
-                Err(_) => {
-                    state.metrics.timeout();
-                    return with_id(
-                        ApiError {
-                            status: StatusCode::GATEWAY_TIMEOUT,
-                            message: "request body read timeout".into(),
-                            param: None,
-                        }
-                        .response(),
-                        &request_id,
-                    );
-                }
-                Ok(Err(e)) => {
+            let chunk = match field.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => {
                     state.metrics.transcribe_error();
                     let status = e.status();
                     let mut error =
@@ -375,9 +347,8 @@ async fn transcribe(State(state): State<HttpState>, request: Request) -> Respons
             }
             field_bytes.extend_from_slice(&chunk);
         }
-        let bytes = axum::body::Bytes::from(field_bytes);
-        total += bytes.len();
-        parts.push((name, filename, bytes.to_vec()));
+        total += field_bytes.len();
+        parts.push((name, filename, field_bytes));
     }
     let input = match parse_fields(parts, state.context.capabilities.rnnt.is_some()) {
         Ok(v) => v,
@@ -962,26 +933,21 @@ mod tests {
         assert_eq!(invalid_id.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[tokio::test]
-    async fn upload_limit_does_not_reduce_admitted_inference_parallelism() {
-        let (router, _harness, _admission) =
-            test_router(2, 8192, std::time::Duration::from_secs(2)).await;
-        let audio = wav_silence();
-        let (content_type, body) =
-            multipart(&[("file", "clip.wav", &audio), ("model", "", b"gigaam-v3")]);
-        let request = |body: Vec<u8>| {
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/v1/audio/transcriptions")
-                .header("content-type", content_type.clone())
-                .body(axum::body::Body::from(body))
-                .unwrap()
-        };
-        let first = router.clone().oneshot(request(body.clone()));
-        let second = router.clone().oneshot(request(body));
-        let (first, second) = tokio::join!(first, second);
-        assert_eq!(first.unwrap().status(), StatusCode::OK);
-        assert_eq!(second.unwrap().status(), StatusCode::OK);
+    #[test]
+    fn upload_slot_is_independent_of_http_admission() {
+        let admission = std::sync::Arc::new(
+            crate::admission::AdmissionState::new(
+                &crate::ServiceAdmission::new(2, 8, std::time::Duration::from_secs(2)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let _upload = admission.admit_upload().unwrap();
+        let _first_http = admission.admit_http().unwrap();
+        let _second_http = admission.admit_http().unwrap();
+        assert!(matches!(
+            admission.admit_http(),
+            Err(crate::admission::AdmissionRefusal::Overloaded)
+        ));
     }
 
     #[tokio::test]

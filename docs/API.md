@@ -79,7 +79,7 @@ channel, start, end, and text.
 | 503 | Admission overload or draining, worker failure, a worker queue wait exceeding 60 seconds, or an operational transcription failure. |
 | 504 | The processing deadline expired. |
 
-An upload that does not finish reading within `ASR_REQ_TIMEOUT_SEC` returns 504 and releases the shared upload slot. The native endpoint keeps its JSON error envelope. This read deadline applies before inference admission; the whole-request processing deadline continues to bound inference separately.
+An upload that does not finish reading within `ASR_REQ_TIMEOUT_SEC` returns 504 and releases the shared upload slot. The native endpoint keeps its JSON error envelope. This read deadline applies before inference admission; the whole-request processing deadline continues to bound inference separately. The service intentionally permits one request body to be read at a time across native and OpenAI transcription routes; concurrent upload attempts receive 503 even when inference capacity remains available. This bounds buffered upload memory independently of inference concurrency.
 
 A recognition call waits at most 60 seconds to start once its decoder worker queue accepts
 it; that queue-wait expiry returns 503. The separate whole-request processing deadline,
